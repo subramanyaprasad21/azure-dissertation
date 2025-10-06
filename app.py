@@ -1,29 +1,87 @@
 # app.py
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-import joblib, os
+import joblib
+import os
 import numpy as np
+from typing import Tuple, Optional
 
-# --- CONFIG: paths (assume models/ folder is in repo root) ---
-MODEL_PATH = os.path.join("models", "xgboost_model.pkl")
-SCALER_PATH = os.path.join("models", "scaler.pkl")
-FEATURES_PATH = os.path.join("models", "features.txt")
+app = FastAPI(title="PdM RUL API (XGBoost)")
 
-# --- Load model, scaler, features ---
-if not os.path.exists(MODEL_PATH):
-    raise FileNotFoundError(f"Model not found at {MODEL_PATH}")
-if not os.path.exists(SCALER_PATH):
-    raise FileNotFoundError(f"Scaler not found at {SCALER_PATH}")
-if not os.path.exists(FEATURES_PATH):
-    raise FileNotFoundError(f"Features list not found at {FEATURES_PATH}")
+# -------------------------
+# Helper: locate model files
+# -------------------------
+def find_artifact_paths() -> Tuple[str, str, str]:
+    """
+    Try common locations for model artifacts.
+    Return (model_path, scaler_path, features_path).
+    Raises FileNotFoundError if none found.
+    """
+    candidates = [
+        # repo root
+        ("xgboost_model.pkl", "scaler.pkl", "features.txt"),
+        # models/ subfolder
+        (os.path.join("models", "xgboost_model.pkl"),
+         os.path.join("models", "scaler.pkl"),
+         os.path.join("models", "features.txt")),
+    ]
 
-model = joblib.load(MODEL_PATH)
-scaler = joblib.load(SCALER_PATH)
-with open(FEATURES_PATH, "r") as f:
-    internal_features = [line.strip() for line in f.readlines() if line.strip()]
+    for model_p, scaler_p, feat_p in candidates:
+        if os.path.exists(model_p) and os.path.exists(scaler_p) and os.path.exists(feat_p):
+            return model_p, scaler_p, feat_p
 
-# --- Human-readable names mapping (change names if you prefer) ---
-# Map readable_name -> internal feature name (internal_features must remain in same order)
+    # not found
+    raise FileNotFoundError(
+        "Model artifacts not found. Expected either root: "
+        "'xgboost_model.pkl','scaler.pkl','features.txt' or in 'models/' subfolder."
+    )
+
+# -------------------------
+# Startup diagnostics
+# -------------------------
+print("=== STARTUP: PdM RUL API ===")
+print("cwd:", os.getcwd())
+print("files in cwd:", os.listdir())
+# if there's a models folder, print it too
+if os.path.exists("models"):
+    try:
+        print("files in ./models:", os.listdir("models"))
+    except Exception as e:
+        print("could not list ./models:", str(e))
+
+# -------------------------
+# Load artifacts (safe)
+# -------------------------
+try:
+    MODEL_PATH, SCALER_PATH, FEATURES_PATH = find_artifact_paths()
+    print(f"Using MODEL_PATH={MODEL_PATH}, SCALER_PATH={SCALER_PATH}, FEATURES_PATH={FEATURES_PATH}")
+except FileNotFoundError as e:
+    # re-raise as RuntimeError so container shows it in logs and app continues to start
+    print("ERROR:", str(e))
+    # we still create the app but will return 500 on predict until fixed
+    MODEL_PATH = SCALER_PATH = FEATURES_PATH = None
+
+model = None
+scaler = None
+internal_features = []
+
+if MODEL_PATH and SCALER_PATH and FEATURES_PATH:
+    try:
+        model = joblib.load(MODEL_PATH)
+        scaler = joblib.load(SCALER_PATH)
+        with open(FEATURES_PATH, "r") as f:
+            internal_features = [line.strip() for line in f.readlines() if line.strip()]
+        print("Model and scaler loaded successfully. Number of features:", len(internal_features))
+    except Exception as e:
+        # If loading fails, print error. We'll return 500 on predict.
+        print("Failed to load model/scaler/features:", str(e))
+        model = None
+        scaler = None
+        internal_features = []
+
+# -------------------------
+# Human-readable mapping
+# -------------------------
 readable_to_internal = {
     "Altitude_factor": "op_setting1",
     "Throttle_resolver_angle": "op_setting2",
@@ -51,67 +109,95 @@ readable_to_internal = {
     "LPT_coolant_bleed": "s21",
 }
 
-# build reverse map for validation convenience
-internal_set = set(internal_features)
-readable_set = set(readable_to_internal.keys())
+# Inverse map (internal -> list of readable names)
+internal_to_readables = {}
+for r, i in readable_to_internal.items():
+    internal_to_readables.setdefault(i, []).append(r)
 
-app = FastAPI(title="PdM RUL API (XGBoost)")
-
-
+# -------------------------
+# Request model
+# -------------------------
 class InputData(BaseModel):
-    data: dict  # accept dict of feature:value. keys can be internal OR readable names
+    data: dict
 
+# -------------------------
+# Endpoints
+# -------------------------
+@app.get("/")
+def root():
+    return {
+        "message": "Predictive Maintenance RUL API. Use /predict to POST sensor values.",
+        "note": "This API expects feature names (s1..s21 and op_setting1..3) or human-readable names.",
+        "health": "/health",
+        "info": "/info"
+    }
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "model": os.path.basename(MODEL_PATH)}
+    ok = model is not None and scaler is not None and len(internal_features) > 0
+    return {
+        "status": "ok" if ok else "error",
+        "model_path": MODEL_PATH,
+        "scaler_path": SCALER_PATH,
+        "features_count": len(internal_features),
+    }
 
+@app.get("/info")
+def info():
+    # Provide simple feature info (name + readable names if available)
+    features_info = []
+    for feat in internal_features:
+        features_info.append({
+            "internal_name": feat,
+            "readable_aliases": internal_to_readables.get(feat, [])
+        })
+    return {
+        "model_loaded": model is not None,
+        "features": features_info,
+        "note": "You can supply either internal_name or one of readable_aliases in /predict payload."
+    }
 
 @app.post("/predict")
 def predict(payload: InputData):
+    if model is None or scaler is None or not internal_features:
+        # Return 500 with clear message so Railway logs show the reason
+        raise HTTPException(status_code=500, detail="Model or scaler not loaded on server. Check logs.")
+
     user_dict = payload.data
     if not isinstance(user_dict, dict):
-        raise HTTPException(
-            status_code=400,
-            detail="`data` must be an object/dict of feature:value pairs",
-        )
+        raise HTTPException(status_code=400, detail="`data` must be an object/dict of feature:value pairs")
 
-    # Build input vector in the required order (internal_features)
     row = []
     missing = []
     for feat in internal_features:
-        # priority: user may provide readable name that maps to this internal feature
-        val = None
-        # 1) direct internal name
+        val: Optional[float] = None
+        # 1) direct internal key
         if feat in user_dict:
             val = user_dict.get(feat)
         else:
-            # 2) see if user provided a readable name mapping to this feat
-            # find readable keys that map to this internal feat
-            # (this is O(n) over mapping but mapping is small)
-            readable_matches = [r for r, i in readable_to_internal.items() if i == feat]
-            found = False
-            for r in readable_matches:
-                if r in user_dict:
-                    val = user_dict.get(r)
-                    found = True
+            # 2) check readable aliases
+            aliases = internal_to_readables.get(feat, [])
+            for a in aliases:
+                if a in user_dict:
+                    val = user_dict.get(a)
                     break
-        # If still None, default to 0.0 (you can change to throw error instead)
         if val is None:
-            # record missing but continue with zero fill
             missing.append(feat)
             val = 0.0
-        # ensure numeric
         try:
             row.append(float(val))
         except Exception:
-            raise HTTPException(
-                status_code=400, detail=f"Feature '{feat}' has non-numeric value: {val}"
-            )
+            raise HTTPException(status_code=400, detail=f"Feature '{feat}' has non-numeric value: {val}")
 
-    # Convert to numpy array and scale
     x = np.array(row).reshape(1, -1)
-    x_scaled = scaler.transform(x)
-    pred = model.predict(x_scaled)[0]
+    try:
+        x_scaled = scaler.transform(x)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Scaler transform failed: {str(e)}")
+
+    try:
+        pred = model.predict(x_scaled)[0]
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Model prediction failed: {str(e)}")
 
     return {"Predicted_RUL": float(pred), "missing_filled_with_zero": missing}
